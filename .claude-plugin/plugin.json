@@ -1,20 +1,20 @@
 {
-  "name": "superpowers",
-  "description": "Core skills library for Claude Code: TDD, debugging, collaboration patterns, and proven techniques",
-  "version": "5.1.0",
+  "name": "superpowers-kanban",
+  "description": "Agent-driven kanban workflow for Superpowers, powered by kanban-md. Plans break down into cards, agents pick them up autonomously, pause for user questions, then resume.",
+  "version": "0.1.0",
   "author": {
-    "name": "Jesse Vincent",
-    "email": "jesse@fsck.com"
+    "name": "designmakc",
+    "email": "designmakc@gmail.com"
   },
-  "homepage": "https://github.com/obra/superpowers",
-  "repository": "https://github.com/obra/superpowers",
+  "homepage": "https://github.com/designmakc/superpowers-kanban",
+  "repository": "https://github.com/designmakc/superpowers-kanban",
   "license": "MIT",
   "keywords": [
-    "skills",
-    "tdd",
-    "debugging",
-    "collaboration",
-    "best-practices",
-    "workflows"
+    "kanban",
+    "superpowers",
+    "multi-agent",
+    "autonomous",
+    "claude-code",
+    "agent-driven-development"
   ]
 }

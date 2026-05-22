@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Convert a Superpowers plan markdown file into a kanban-md board.
+
+Reads a plan markdown structured as:
+
+    # <Plan title>
+
+    <design summary - any markdown - becomes the epic body>
+
+    ## <Task 1 title>
+
+    <task 1 body>
+
+    ## <Task 2 title>
+
+    <task 2 body>
+
+For each H2, creates one task in the plan board (status: todo). The H1
+title and the text before the first H2 become the body of an epic card
+added to the roadmap board (tagged plan:<plan-id> so the auto-loop can
+follow it back to this board).
+
+Idempotent: if the plan board already exists, refuses with an error
+unless --force is passed. With --force, ONLY the cards are added on top
+of the existing board (no destructive reset).
+
+Usage:
+    kanban-add-plan <plan-id> <path-to-plan.md> [--project-root DIR] [--dry-run] [--force]
+
+Exits non-zero on any failure. Requires `kanban-md` on PATH.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def die(msg: str) -> "NoReturn":
+    print(f"[kanban-add-plan] ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def log(msg: str) -> None:
+    print(f"[kanban-add-plan] {msg}")
+
+
+def run(cmd: list[str], cwd: Path | None = None, capture: bool = False) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=False,
+        text=True,
+        capture_output=capture,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        out = (result.stdout or "") + (result.stderr or "")
+        die(f"Command failed ({result.returncode}): {' '.join(cmd)}\n{out}")
+    return result
+
+
+def slugify(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    return text.strip("-")
+
+
+def parse_plan(md: str) -> tuple[str, str, list[tuple[str, str]]]:
+    """Parse plan markdown into (epic_title, epic_body, [(task_title, task_body), ...]).
+
+    Rules:
+      - The first H1 (line starting with single #) sets the epic title.
+      - All text after that H1 and before the first H2 becomes the epic body.
+      - Each H2 starts a new task; its body is everything until the next H2 or EOF.
+      - Lines inside fenced code blocks are not treated as headings.
+    """
+    lines = md.splitlines()
+    in_fence = False
+    epic_title: str | None = None
+    epic_body_lines: list[str] = []
+    tasks: list[tuple[str, list[str]]] = []
+    state = "preamble"  # preamble (before H1) | epic_body (after H1, before H2) | task
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            if state == "epic_body":
+                epic_body_lines.append(line)
+            elif state == "task":
+                tasks[-1][1].append(line)
+            continue
+
+        if not in_fence:
+            h1 = re.match(r"^#\s+(.+)$", line)
+            h2 = re.match(r"^##\s+(.+)$", line)
+            if h1 and epic_title is None:
+                epic_title = h1.group(1).strip()
+                state = "epic_body"
+                continue
+            if h2:
+                tasks.append((h2.group(1).strip(), []))
+                state = "task"
+                continue
+
+        if state == "epic_body":
+            epic_body_lines.append(line)
+        elif state == "task":
+            tasks[-1][1].append(line)
+
+    if epic_title is None:
+        die("Plan must start with an H1 line: '# <title>'")
+    if not tasks:
+        die("Plan has no H2 task headings. At least one '## <task title>' required.")
+
+    epic_body = "\n".join(epic_body_lines).strip()
+    task_bodies = [(t, "\n".join(b).strip()) for t, b in tasks]
+    return epic_title, epic_body, task_bodies
+
+
+def update_config_json(config_path: Path, plan_id: str) -> None:
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+    else:
+        config = {"version": 1}
+    config["active_plan"] = plan_id
+    config.setdefault("agent_name", "claude")
+    config.setdefault("auto_mode", {"max_iterations": 20, "claim_ttl_minutes": 60})
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("plan_id", help="Slug for the plan; becomes the plan-board directory name")
+    parser.add_argument("plan_md", help="Path to the plan markdown file produced by superpowers:writing-plans")
+    parser.add_argument("--project-root", default=".", help="Project root (default: cwd)")
+    parser.add_argument("--dry-run", action="store_true", help="Parse and print actions, do not modify anything")
+    parser.add_argument("--force", action="store_true", help="Append cards to an existing plan board instead of erroring")
+    args = parser.parse_args()
+
+    if not re.match(r"^[a-z0-9][a-z0-9-]*$", args.plan_id):
+        die(f"plan_id must be a kebab-case slug (lowercase letters, digits, hyphens). Got: {args.plan_id!r}")
+
+    if not shutil.which("kanban-md"):
+        die("kanban-md not on PATH. Run bin/install-kanban-md first.")
+
+    plan_md_path = Path(args.plan_md).resolve()
+    if not plan_md_path.is_file():
+        die(f"Plan markdown not found: {plan_md_path}")
+
+    project_root = Path(args.project_root).resolve()
+    sp_dir = project_root / ".superpowers-kanban"
+    roadmap_dir = sp_dir / "roadmap"
+    plans_dir = sp_dir / "plans"
+    plan_board_dir = plans_dir / args.plan_id
+
+    if not roadmap_dir.is_dir():
+        die(f"Roadmap board not found at {roadmap_dir}. Run /kanban-init first.")
+
+    if plan_board_dir.exists() and not args.force:
+        die(f"Plan board already exists: {plan_board_dir}. Pass --force to append, or pick a different plan_id.")
+
+    epic_title, epic_body, tasks = parse_plan(plan_md_path.read_text())
+
+    log(f"Plan: {args.plan_id}")
+    log(f"Epic title: {epic_title}")
+    log(f"Tasks parsed: {len(tasks)}")
+    for i, (t, _) in enumerate(tasks, 1):
+        log(f"  [{i}] {t}")
+
+    if args.dry_run:
+        log("--dry-run: not modifying anything")
+        return
+
+    # 1. Create the plan board if missing.
+    if not plan_board_dir.exists():
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        # `kanban-md init` always creates a `kanban/` subdir under cwd, then we rename.
+        # Run it from plans/ with --name = plan_id, then mv kanban -> <plan_id>.
+        run(["kanban-md", "init", "--name", args.plan_id], cwd=plans_dir)
+        # The interactive .gitignore prompt only fires when stdin is a TTY; since we
+        # run via subprocess it answers "no" by default. If a kanban/.gitignore was
+        # nonetheless created we'll detect and remove it after rename.
+        created = plans_dir / "kanban"
+        if not created.is_dir():
+            die(f"kanban-md init did not create expected directory: {created}")
+        created.rename(plan_board_dir)
+        stray_gitignore = plans_dir / ".gitignore"
+        if stray_gitignore.exists() and stray_gitignore.read_text().strip() == "kanban/":
+            stray_gitignore.unlink()
+        log(f"Created plan board: {plan_board_dir.relative_to(project_root)}")
+
+    # 2. Create cards on the plan board.
+    for title, body in tasks:
+        cmd = [
+            "kanban-md", "--dir", str(plan_board_dir),
+            "create", title,
+            "--status", "todo",
+            "--tags", f"plan:{args.plan_id}",
+        ]
+        if body:
+            cmd += ["--body", body]
+        run(cmd)
+    log(f"Added {len(tasks)} cards to plan board")
+
+    # 3. Add an epic to the roadmap pointing at the plan.
+    epic_body_with_link = epic_body or ""
+    epic_body_with_link += (
+        f"\n\n---\n"
+        f"Plan board: `plans/{args.plan_id}/`\n"
+        f"Created from: `{plan_md_path.relative_to(project_root) if plan_md_path.is_relative_to(project_root) else plan_md_path}`"
+    )
+    epic_card_title = epic_title if epic_title.lower().startswith("plan:") else f"Plan: {epic_title}"
+    run([
+        "kanban-md", "--dir", str(roadmap_dir),
+        "create", epic_card_title,
+        "--status", "todo",
+        "--tags", f"type:epic,plan:{args.plan_id}",
+        "--body", epic_body_with_link.strip(),
+    ])
+    log("Added epic card to roadmap")
+
+    # 4. Set the active plan in plugin config.
+    update_config_json(sp_dir / "config.json", args.plan_id)
+    log(f"Set active_plan = {args.plan_id} in config.json")
+
+    log("Done.")
+
+
+if __name__ == "__main__":
+    main()

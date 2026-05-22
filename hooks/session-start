@@ -1,57 +1,109 @@
 #!/usr/bin/env bash
-# SessionStart hook for superpowers plugin
+# SessionStart hook for superpowers-kanban.
+#
+# If the user's project has been initialized with /kanban-init (i.e.
+# .superpowers-kanban/ exists at the harness cwd), inject a compact
+# status summary into the session context: active plan, card counts,
+# blocked-card list, and the available slash commands.
+#
+# If no .superpowers-kanban exists, this hook is a no-op (emits an
+# empty additionalContext to avoid noise on every session).
 
 set -euo pipefail
 
-# Determine plugin root directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Check if legacy skills directory exists and build warning
-warning_message=""
-legacy_skills_dir="${HOME}/.config/superpowers/skills"
-if [ -d "$legacy_skills_dir" ]; then
-    warning_message="\n\n<important-reminder>IN YOUR FIRST REPLY AFTER SEEING THIS MESSAGE YOU MUST TELL THE USER:⚠️ **WARNING:** Superpowers now uses Claude Code's skills system. Custom skills in ~/.config/superpowers/skills will not be read. Move custom skills to ~/.claude/skills instead. To make this message go away, remove ~/.config/superpowers/skills</important-reminder>"
+# Where is the user's project root? Use harness-provided cwd if set;
+# fall back to current working directory.
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-${PWD}}"
+SP_DIR="${PROJECT_ROOT}/.superpowers-kanban"
+
+summary=""
+if [ -d "$SP_DIR" ]; then
+  if command -v kanban-md >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    # Pull a JSON status report. Don't fail the hook on script error.
+    status_json=$("${PLUGIN_ROOT}/bin/roadmap-status" --project-root "$PROJECT_ROOT" --json 2>/dev/null || true)
+    if [ -n "$status_json" ]; then
+      summary=$(STATUS_JSON="$status_json" PROJECT_ROOT_ENV="$PROJECT_ROOT" python3 <<'PY'
+import json, os
+
+raw = os.environ.get("STATUS_JSON", "")
+project_root = os.environ.get("PROJECT_ROOT_ENV", ".")
+try:
+    data = json.loads(raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+overall = data.get("overall", {})
+plans = data.get("plans", [])
+
+# Active plan from config
+active = None
+cfg_path = os.path.join(project_root, ".superpowers-kanban", "config.json")
+if os.path.isfile(cfg_path):
+    try:
+        active = json.load(open(cfg_path)).get("active_plan")
+    except Exception:
+        active = None
+
+lines = []
+lines.append("## superpowers-kanban: project status")
+lines.append("")
+if not plans:
+    lines.append("This project is initialized but has no plan boards yet.")
+    lines.append("Next: run `/kanban-add-plan <plan-id> <path-to-plan.md>` after `superpowers:writing-plans` produces a plan.")
+else:
+    lines.append(f"Active plan: **{active or '(none set)'}**")
+    lines.append(f"Plans: {overall.get('plans', 0)} | Cards: {overall.get('cards_total', 0)} "
+                 f"(done {overall.get('cards_done', 0)}, in-progress {overall.get('cards_in_progress', 0)}, "
+                 f"todo {overall.get('cards_todo', 0)}, blocked {overall.get('cards_blocked', 0)})")
+    lines.append("")
+    for p in plans:
+        c = p.get("counts", {})
+        blocked = p.get("blocked", 0)
+        suffix = f", **{blocked} BLOCKED**" if blocked else ""
+        lines.append(f"- `plans/{p['plan_id']}` ({p.get('epic_status','-')}): "
+                     f"{p.get('total',0)} cards, "
+                     f"done={c.get('done',0)}, "
+                     f"in-prog={c.get('in-progress',0)}, "
+                     f"todo={c.get('todo',0)}{suffix}")
+
+    if overall.get("cards_blocked", 0) > 0:
+        lines.append("")
+        lines.append("⚠️ One or more cards are BLOCKED waiting on your answer. "
+                     "Use `/kanban-view` or `kanban-md --dir <board> list --json` to find them, "
+                     "then `/kanban-resume <card-id> \"<answer>\"` to unblock.")
+lines.append("")
+lines.append("Commands: `/kanban-init`, `/kanban-add-plan`, `/kanban-auto`, `/kanban-resume`, `/roadmap-status`, `/kanban-view`")
+print("\n".join(lines))
+PY
+      )
+    fi
+  fi
 fi
 
-# Read using-superpowers content
-using_superpowers_content=$(cat "${PLUGIN_ROOT}/skills/using-superpowers/SKILL.md" 2>&1 || echo "Error reading using-superpowers skill")
-
-# Escape string for JSON embedding using bash parameter substitution.
-# Each ${s//old/new} is a single C-level pass - orders of magnitude
-# faster than the character-by-character loop this replaces.
+# Escape for JSON embedding (same scheme as upstream Superpowers hook).
 escape_for_json() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
 }
 
-using_superpowers_escaped=$(escape_for_json "$using_superpowers_content")
-warning_escaped=$(escape_for_json "$warning_message")
-session_context="<EXTREMELY_IMPORTANT>\nYou have superpowers.\n\n**Below is the full content of your 'superpowers:using-superpowers' skill - your introduction to using skills. For all other skills, use the 'Skill' tool:**\n\n${using_superpowers_escaped}\n\n${warning_escaped}\n</EXTREMELY_IMPORTANT>"
+ctx_escaped=$(escape_for_json "$summary")
 
-# Output context injection as JSON.
-# Cursor hooks expect additional_context (snake_case).
-# Claude Code hooks expect hookSpecificOutput.additionalContext (nested).
-# Copilot CLI (v1.0.11+) and others expect additionalContext (top-level, SDK standard).
-# Claude Code reads BOTH additional_context and hookSpecificOutput without
-# deduplication, so we must emit only the field the current platform consumes.
-#
-# Uses printf instead of heredoc to work around bash 5.3+ heredoc hang.
-# See: https://github.com/obra/superpowers/issues/571
+# Emit the right envelope per harness. Mirrors upstream Superpowers logic.
 if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
-  # Cursor sets CURSOR_PLUGIN_ROOT (may also set CLAUDE_PLUGIN_ROOT)
-  printf '{\n  "additional_context": "%s"\n}\n' "$session_context"
+  printf '{\n  "additional_context": "%s"\n}\n' "$ctx_escaped"
 elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
-  # Claude Code sets CLAUDE_PLUGIN_ROOT without COPILOT_CLI
-  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
+  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$ctx_escaped"
 else
-  # Copilot CLI (sets COPILOT_CLI=1) or unknown platform — SDK standard format
-  printf '{\n  "additionalContext": "%s"\n}\n' "$session_context"
+  printf '{\n  "additionalContext": "%s"\n}\n' "$ctx_escaped"
 fi
 
 exit 0
