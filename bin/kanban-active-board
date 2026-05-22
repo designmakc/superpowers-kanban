@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Print the absolute path to the active plan board, or roadmap if no plan is active.
+#
+# Reads .superpowers-kanban/config.json for active_plan, then resolves to
+# .superpowers-kanban/plans/<active_plan>/. If active_plan is null or
+# missing, prints the roadmap board path. Errors if no .superpowers-kanban
+# directory exists.
+#
+# Usage:
+#   kanban-active-board [--project-root DIR]
+
+set -euo pipefail
+
+PROJECT_ROOT="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) printf 'Unknown arg: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+sp_dir="${PROJECT_ROOT}/.superpowers-kanban"
+[ -d "$sp_dir" ] || { printf 'Not initialized: %s/.superpowers-kanban not found. Run /kanban-init.\n' "$PROJECT_ROOT" >&2; exit 1; }
+
+config="${sp_dir}/config.json"
+active=""
+if [ -f "$config" ]; then
+  active=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c.get('active_plan') or '')" "$config")
+fi
+
+if [ -n "$active" ]; then
+  board="${sp_dir}/plans/${active}"
+  [ -d "$board" ] || { printf 'active_plan=%s but board not found at %s\n' "$active" "$board" >&2; exit 1; }
+else
+  board="${sp_dir}/roadmap"
+fi
+
+# Print absolute path so callers can use it from any cwd.
+cd "$board" && pwd
