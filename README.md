@@ -49,7 +49,7 @@ cd my-project && claude
 | Command | Status | Purpose |
 |---|---|---|
 | `/kanban-init` | M1 ✅ | Initialize the plugin in a project |
-| `/kanban-add-plan` | M2 ⏳ | Convert a Superpowers plan into a board |
+| `/kanban-add-plan` | M2 ✅ | Convert a Superpowers plan into a board |
 | `/kanban-auto` | M3 ⏳ | Run the auto-loop |
 | `/kanban-resume` | M3 ⏳ | Answer a blocked card and resume |
 | `/roadmap-status` | M4 ⏳ | Show aggregated progress across all plans |
@@ -88,7 +88,7 @@ When a subagent needs a human answer:
 ## Roadmap
 
 - [x] **M1** — Foundation: plugin/marketplace metadata, `install-kanban-md`, base skill, `/kanban-init`
-- [ ] **M2** — `/kanban-add-plan` integrates with `superpowers:writing-plans`
+- [x] **M2** — `/kanban-add-plan` integrates with `superpowers:writing-plans`
 - [ ] **M3** — `/kanban-auto` + `/kanban-resume` + auto-mode skill + question protocol
 - [ ] **M4** — Roadmap aggregation + `/roadmap-status`
 - [ ] **M5** — Read-only web viewer + `/kanban-view`
