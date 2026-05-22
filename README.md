@@ -52,7 +52,7 @@ cd my-project && claude
 | `/kanban-add-plan` | M2 ✅ | Convert a Superpowers plan into a board |
 | `/kanban-auto` | M3 ✅ | Run the auto-loop |
 | `/kanban-resume` | M3 ✅ | Answer a blocked card and resume |
-| `/roadmap-status` | M4 ⏳ | Show aggregated progress across all plans |
+| `/roadmap-status` | M4 ✅ | Show aggregated progress across all plans |
 | `/kanban-view` | M5 ⏳ | Open a read-only web viewer of all boards |
 
 ## Data layout (in your project)
@@ -90,7 +90,7 @@ When a subagent needs a human answer:
 - [x] **M1** — Foundation: plugin/marketplace metadata, `install-kanban-md`, base skill, `/kanban-init`
 - [x] **M2** — `/kanban-add-plan` integrates with `superpowers:writing-plans`
 - [x] **M3** — `/kanban-auto` + `/kanban-resume` + auto-mode skill + question protocol
-- [ ] **M4** — Roadmap aggregation + `/roadmap-status`
+- [x] **M4** — Roadmap aggregation + `/roadmap-status`
 - [ ] **M5** — Read-only web viewer + `/kanban-view`
 - [ ] **M6** — Session-start hook, end-to-end tests, polish
 - [ ] Later — Mirror to Codex / Cursor / Gemini / Copilot harnesses

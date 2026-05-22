@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Print aggregated status for all plan boards, and optionally sync the
+status of each roadmap epic card to reflect its plan's progress.
+
+For each `.superpowers-kanban/plans/<plan-id>/` board, counts cards by
+status. Finds the corresponding epic in `.superpowers-kanban/roadmap/`
+by the tag `plan:<plan-id>` and decides what status the epic should
+sit in based on aggregate counts:
+
+  - All cards done (and at least one card exists)   -> epic = done
+  - Any card in_progress, review, or blocked        -> epic = in-progress
+  - Otherwise (all backlog/todo or empty plan)      -> epic = todo
+
+With --apply, runs `kanban-md move` to update the epic's status when it
+disagrees with the computed target. Without --apply (the default),
+prints a report only.
+
+Usage:
+  roadmap-status [--project-root DIR] [--apply] [--json]
+
+Exit codes:
+  0 - success
+  1 - no .superpowers-kanban directory, or kanban-md missing
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+STATUSES = ["backlog", "todo", "in-progress", "review", "done", "archived"]
+
+
+def die(msg: str) -> "NoReturn":
+    print(f"[roadmap-status] ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def kanban_json(board: Path, args: list[str]) -> object:
+    cmd = ["kanban-md", "--dir", str(board), "--json"] + args
+    res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if res.returncode != 0:
+        die(f"{' '.join(cmd)}\n{res.stdout}{res.stderr}")
+    return json.loads(res.stdout)
+
+
+def list_tasks(board: Path) -> list[dict]:
+    """Return all tasks on a board as a list of dicts. kanban-md `list`
+    output shape varies by version; normalize via the tasks/ files
+    directly when convenient. Here we use `kanban-md list --json`."""
+    data = kanban_json(board, ["list"])
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("tasks", "items", "results"):
+            if isinstance(data.get(key), list):
+                return data[key]
+    return []
+
+
+def count_by_status(tasks: list[dict]) -> dict[str, int]:
+    counts = {s: 0 for s in STATUSES}
+    blocked = 0
+    for t in tasks:
+        s = t.get("status", "")
+        if s in counts:
+            counts[s] += 1
+        if t.get("blocked"):
+            blocked += 1
+    counts["__blocked__"] = blocked
+    counts["__total__"] = sum(counts[s] for s in STATUSES)
+    return counts
+
+
+def target_epic_status(counts: dict[str, int]) -> str:
+    total = counts["__total__"]
+    if total == 0:
+        return "todo"
+    non_terminal_active = counts["in-progress"] + counts["review"]
+    blocked = counts["__blocked__"]
+    if total > 0 and counts["done"] + counts["archived"] == total:
+        return "done"
+    if non_terminal_active > 0 or blocked > 0:
+        return "in-progress"
+    return "todo"
+
+
+def find_epic_for_plan(epic_tasks: list[dict], plan_id: str) -> dict | None:
+    target_tag = f"plan:{plan_id}"
+    epic_tag = "type:epic"
+    for t in epic_tasks:
+        tags = t.get("tags") or []
+        if target_tag in tags and epic_tag in tags:
+            return t
+    return None
+
+
+def apply_epic_move(roadmap: Path, epic_id: int, current: str, target: str, agent: str) -> bool:
+    """Move the epic to target status if different from current. Returns
+    True if a move was applied. Always passes --claim so kanban-md is
+    happy regardless of which side of the transition has require_claim,
+    then releases immediately so successive runs don't trip over a stale
+    claim."""
+    if current == target:
+        return False
+    cmd_move = ["kanban-md", "--dir", str(roadmap), "move", str(epic_id), target, "--claim", agent]
+    res = subprocess.run(cmd_move, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if res.returncode != 0:
+        die(f"epic move failed: {' '.join(cmd_move)}\n{res.stdout}{res.stderr}")
+    cmd_release = ["kanban-md", "--dir", str(roadmap), "edit", str(epic_id), "--release"]
+    rel = subprocess.run(cmd_release, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    # Releasing an unclaimed task may exit nonzero on some versions; ignore.
+    return True
+
+
+def format_row(plan_id: str, epic_title: str, epic_status: str, counts: dict[str, int]) -> str:
+    total = counts["__total__"]
+    if total == 0:
+        progress = "  0%"
+    else:
+        progress = f"{(counts['done'] + counts['archived']) * 100 // total:>3d}%"
+    blocked_suffix = f", {counts['__blocked__']} blocked" if counts["__blocked__"] else ""
+    return (
+        f"  [{epic_status:>11}] {epic_title:<40s}  "
+        f"plans/{plan_id:<20s}  {total:>2d} cards  {progress}  "
+        f"(done={counts['done']}, in-prog={counts['in-progress']}, "
+        f"review={counts['review']}, todo={counts['todo']}, "
+        f"backlog={counts['backlog']}{blocked_suffix})"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--project-root", default=".", help="Project root (default: cwd)")
+    parser.add_argument("--apply", action="store_true", help="Move roadmap epics to reflect computed status")
+    parser.add_argument("--json", dest="emit_json", action="store_true", help="Emit JSON instead of human report")
+    args = parser.parse_args()
+
+    if not shutil.which("kanban-md"):
+        die("kanban-md not on PATH. Run /kanban-init first.")
+
+    project_root = Path(args.project_root).resolve()
+    sp_dir = project_root / ".superpowers-kanban"
+    roadmap_dir = sp_dir / "roadmap"
+    plans_dir = sp_dir / "plans"
+
+    if not roadmap_dir.is_dir():
+        die(f"Roadmap board not found at {roadmap_dir}. Run /kanban-init first.")
+
+    config = {}
+    config_path = sp_dir / "config.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+    agent = config.get("agent_name", "claude")
+
+    plan_dirs = sorted([p for p in plans_dir.glob("*") if p.is_dir()]) if plans_dir.exists() else []
+    epic_tasks = list_tasks(roadmap_dir)
+
+    report: list[dict] = []
+    moves: list[tuple[int, str, str, str]] = []  # (epic_id, plan_id, from, to)
+
+    for plan_dir in plan_dirs:
+        plan_id = plan_dir.name
+        tasks = list_tasks(plan_dir)
+        counts = count_by_status(tasks)
+        epic = find_epic_for_plan(epic_tasks, plan_id)
+        epic_title = epic.get("title") if epic else f"(no epic for {plan_id})"
+        epic_status = epic.get("status") if epic else "-"
+        target = target_epic_status(counts)
+        will_move = epic is not None and epic_status != target
+        if will_move and args.apply:
+            apply_epic_move(roadmap_dir, epic["id"], epic_status, target, agent)
+            moves.append((epic["id"], plan_id, epic_status, target))
+            epic_status = target
+
+        report.append({
+            "plan_id": plan_id,
+            "epic_id": epic["id"] if epic else None,
+            "epic_title": epic_title,
+            "epic_status": epic_status,
+            "epic_status_target": target,
+            "counts": {k: counts[k] for k in counts if not k.startswith("__")},
+            "total": counts["__total__"],
+            "blocked": counts["__blocked__"],
+            "needs_move": will_move and not args.apply,
+        })
+
+    overall = {
+        "plans": len(plan_dirs),
+        "cards_total": sum(r["total"] for r in report),
+        "cards_done": sum(r["counts"]["done"] + r["counts"]["archived"] for r in report),
+        "cards_in_progress": sum(r["counts"]["in-progress"] + r["counts"]["review"] for r in report),
+        "cards_todo": sum(r["counts"]["todo"] + r["counts"]["backlog"] for r in report),
+        "cards_blocked": sum(r["blocked"] for r in report),
+    }
+
+    if args.emit_json:
+        print(json.dumps({"plans": report, "overall": overall, "moves_applied": moves}, indent=2))
+        return
+
+    if not report:
+        print("No plans yet. Run /kanban-add-plan <id> <plan.md> to create one.")
+        return
+
+    print(f"Roadmap status ({overall['plans']} plans, {overall['cards_total']} cards total):")
+    print()
+    for r in report:
+        print(format_row(r["plan_id"], r["epic_title"], r["epic_status"], {
+            **r["counts"],
+            "__blocked__": r["blocked"],
+            "__total__": r["total"],
+        }))
+    print()
+    pct = (overall["cards_done"] * 100 // overall["cards_total"]) if overall["cards_total"] else 0
+    print(
+        f"Overall: {overall['cards_total']} cards | "
+        f"{overall['cards_done']} done ({pct}%) | "
+        f"{overall['cards_in_progress']} in-progress | "
+        f"{overall['cards_todo']} todo | "
+        f"{overall['cards_blocked']} blocked"
+    )
+    if moves:
+        print()
+        print("Applied epic moves:")
+        for eid, pid, frm, to in moves:
+            print(f"  epic #{eid} ({pid}): {frm} -> {to}")
+    elif any(r["needs_move"] for r in report):
+        print()
+        print("Some epics are out of sync with their plans. Re-run with --apply to update.")
+
+
+if __name__ == "__main__":
+    main()
