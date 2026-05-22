@@ -1,0 +1,20 @@
+{
+  "name": "superpowers-kanban",
+  "description": "Agent-driven kanban workflow for Superpowers, powered by kanban-md. Plans break down into cards, agents pick them up autonomously, pause for user questions, then resume.",
+  "version": "0.1.0",
+  "author": {
+    "name": "designmakc",
+    "email": "designmakc@gmail.com"
+  },
+  "homepage": "https://github.com/designmakc/superpowers-kanban",
+  "repository": "https://github.com/designmakc/superpowers-kanban",
+  "license": "MIT",
+  "keywords": [
+    "kanban",
+    "superpowers",
+    "multi-agent",
+    "autonomous",
+    "claude-code",
+    "agent-driven-development"
+  ]
+}

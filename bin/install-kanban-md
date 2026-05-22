@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Install the kanban-md binary if it isn't already on PATH.
+#
+# Strategy, in order:
+#   1. If `kanban-md` is on PATH -> done, print version, exit 0.
+#   2. If `go` is on PATH       -> `go install github.com/antopolskiy/kanban-md/cmd/kanban-md@latest`
+#   3. Otherwise                -> download release tarball from GitHub for the
+#                                  current OS/arch into ~/.local/bin/.
+#
+# Honors environment overrides:
+#   KANBAN_MD_VERSION  pin a specific version, e.g. "0.33.0" (default: latest release)
+#   KANBAN_MD_BIN_DIR  install dir for binary fallback (default: $HOME/.local/bin)
+
+set -euo pipefail
+
+REPO_OWNER="antopolskiy"
+REPO_NAME="kanban-md"
+INSTALL_DIR="${KANBAN_MD_BIN_DIR:-$HOME/.local/bin}"
+
+log() { printf '[install-kanban-md] %s\n' "$*"; }
+die() { printf '[install-kanban-md] ERROR: %s\n' "$*" >&2; exit 1; }
+
+if command -v kanban-md >/dev/null 2>&1; then
+  log "kanban-md already installed: $(kanban-md --version 2>/dev/null || echo 'version unknown')"
+  exit 0
+fi
+
+if command -v go >/dev/null 2>&1; then
+  log "Installing via 'go install'..."
+  go install "github.com/${REPO_OWNER}/${REPO_NAME}/cmd/${REPO_NAME}@latest"
+  GOBIN="$(go env GOBIN)"
+  [ -n "$GOBIN" ] || GOBIN="$(go env GOPATH)/bin"
+  if [ ! -x "$GOBIN/${REPO_NAME}" ]; then
+    die "go install reported success but binary not found at $GOBIN/${REPO_NAME}"
+  fi
+  log "Installed to $GOBIN/${REPO_NAME}"
+  log "Make sure $GOBIN is on your PATH."
+  exit 0
+fi
+
+# Detect OS/arch using goreleaser's naming convention.
+uname_s="$(uname -s)"
+uname_m="$(uname -m)"
+case "$uname_s" in
+  Linux)   os="linux" ;;
+  Darwin)  os="darwin" ;;
+  MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+  *) die "Unsupported OS: $uname_s. Install Go or download manually from https://github.com/${REPO_OWNER}/${REPO_NAME}/releases" ;;
+esac
+case "$uname_m" in
+  x86_64|amd64) arch="amd64" ;;
+  arm64|aarch64) arch="arm64" ;;
+  i386|i686) arch="i386" ;;
+  *) die "Unsupported arch: $uname_m. Install Go or download manually." ;;
+esac
+
+# Resolve version (latest by default, via the redirect of /releases/latest).
+if [ -n "${KANBAN_MD_VERSION:-}" ]; then
+  version="${KANBAN_MD_VERSION#v}"
+else
+  command -v curl >/dev/null 2>&1 || die "Need curl to resolve latest version. Install curl or set KANBAN_MD_VERSION."
+  redirect=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest") \
+    || die "Failed to resolve latest release URL"
+  version="${redirect##*/v}"
+  [ -n "$version" ] || die "Could not parse version from $redirect"
+fi
+
+ext="tar.gz"
+[ "$os" = "windows" ] && ext="zip"
+asset="${REPO_NAME}_${version}_${os}_${arch}.${ext}"
+url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${version}/${asset}"
+
+log "Downloading ${asset}"
+log "From: $url"
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$url" -o "$tmpdir/$asset" || die "Download failed: $url"
+elif command -v wget >/dev/null 2>&1; then
+  wget -q "$url" -O "$tmpdir/$asset" || die "Download failed: $url"
+else
+  die "Need curl or wget to download release."
+fi
+
+case "$ext" in
+  tar.gz) tar -xzf "$tmpdir/$asset" -C "$tmpdir" ;;
+  zip)    command -v unzip >/dev/null 2>&1 || die "Need unzip for Windows release."
+          unzip -q "$tmpdir/$asset" -d "$tmpdir" ;;
+esac
+
+bin_in_archive="$tmpdir/${REPO_NAME}"
+[ "$os" = "windows" ] && bin_in_archive="${bin_in_archive}.exe"
+[ -f "$bin_in_archive" ] || die "Binary not found in archive at $bin_in_archive"
+
+mkdir -p "$INSTALL_DIR"
+target="$INSTALL_DIR/${REPO_NAME}"
+[ "$os" = "windows" ] && target="${target}.exe"
+mv "$bin_in_archive" "$target"
+chmod +x "$target"
+
+log "Installed: $target"
+"$target" --version 2>/dev/null || log "Binary installed but --version failed; check manually."
+
+case ":${PATH}:" in
+  *":${INSTALL_DIR}:"*) ;;
+  *) log "WARNING: $INSTALL_DIR is not in your PATH. Add it to your shell rc file:";
+     log "  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+esac

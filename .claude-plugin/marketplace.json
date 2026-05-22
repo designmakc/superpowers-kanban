@@ -1,0 +1,20 @@
+{
+  "name": "superpowers-kanban",
+  "description": "Agent-driven kanban workflow for Superpowers",
+  "owner": {
+    "name": "designmakc",
+    "email": "designmakc@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "superpowers-kanban",
+      "description": "Agent-driven kanban workflow for Superpowers, powered by kanban-md",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "designmakc",
+        "email": "designmakc@gmail.com"
+      }
+    }
+  ]
+}
