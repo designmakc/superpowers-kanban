@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Read-only web viewer for .superpowers-kanban/ boards.
+
+A tiny single-file HTTP server using only the Python stdlib. Reads
+board state fresh on every request (no caching) by shelling out to
+`kanban-md --json list` so the parser stays correct as kanban-md
+evolves.
+
+Routes:
+  /                          — index page listing all boards
+  /board?id=<board-id>       — kanban view of one board
+  /card?board=<id>&task=<n>  — card detail page
+  /static/style.css          — stylesheet
+  /api/boards                — JSON list of boards
+  /api/board?id=<id>         — JSON tasks for one board
+
+Board ids:
+  roadmap, plans/<plan-id>
+
+Usage:
+  kanban-viewer [--project-root DIR] [--host HOST] [--port PORT]
+
+Default host is 127.0.0.1, default port is 8765. Print the URL on
+startup and serve until Ctrl-C.
+
+This viewer does NOT modify any kanban data. To edit, use the kanban-md
+CLI/TUI or the /kanban-resume slash command.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import shutil
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+
+STATUS_ORDER = ["backlog", "todo", "in-progress", "review", "done", "archived"]
+
+
+def die(msg: str) -> "NoReturn":
+    print(f"[kanban-viewer] ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def kanban_json(board_dir: Path, args: list[str]) -> object:
+    cmd = ["kanban-md", "--dir", str(board_dir), "--json"] + args
+    res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if res.returncode != 0:
+        return None
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def list_tasks(board_dir: Path) -> list[dict]:
+    data = kanban_json(board_dir, ["list"])
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("tasks", "items", "results"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    return []
+
+
+def show_task(board_dir: Path, task_id: int) -> dict | None:
+    data = kanban_json(board_dir, ["show", str(task_id)])
+    if isinstance(data, dict):
+        return data.get("task", data)
+    return None
+
+
+def discover_boards(sp_dir: Path) -> list[tuple[str, Path]]:
+    """Return [(board_id, board_dir), ...] for all valid kanban-md boards."""
+    out: list[tuple[str, Path]] = []
+    roadmap = sp_dir / "roadmap"
+    if (roadmap / "config.yml").is_file():
+        out.append(("roadmap", roadmap))
+    plans = sp_dir / "plans"
+    if plans.is_dir():
+        for p in sorted(plans.iterdir()):
+            if p.is_dir() and (p / "config.yml").is_file():
+                out.append((f"plans/{p.name}", p))
+    return out
+
+
+def resolve_board(sp_dir: Path, board_id: str) -> Path | None:
+    if board_id == "roadmap":
+        candidate = sp_dir / "roadmap"
+    elif board_id.startswith("plans/"):
+        candidate = sp_dir / board_id
+    else:
+        return None
+    return candidate if (candidate / "config.yml").is_file() else None
+
+
+STYLE = """
+:root {
+  --bg: #0f1115;
+  --panel: #161922;
+  --panel-2: #1d212b;
+  --border: #2a2f3d;
+  --text: #e6e8ee;
+  --text-dim: #9aa0aa;
+  --accent: #7aa2f7;
+  --green: #7cd181;
+  --yellow: #e7c777;
+  --red: #f7768e;
+  --blocked: #ff5277;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+}
+header {
+  padding: 1rem 1.5rem; border-bottom: 1px solid var(--border);
+  background: var(--panel); display: flex; align-items: center; gap: 1rem;
+}
+header h1 { margin: 0; font-size: 1rem; font-weight: 600; }
+header h1 a { color: var(--accent); text-decoration: none; }
+header nav { display: flex; gap: .5rem; flex-wrap: wrap; }
+header nav a {
+  padding: .3rem .7rem; border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text-dim); text-decoration: none; font-size: .85rem;
+}
+header nav a.active, header nav a:hover { color: var(--text); border-color: var(--accent); }
+main { padding: 1.25rem; }
+.board {
+  display: grid; grid-template-columns: repeat(6, minmax(180px, 1fr));
+  gap: .75rem; align-items: start;
+}
+.col { background: var(--panel); border-radius: 8px; padding: .6rem .55rem; min-height: 80px; }
+.col-header {
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-dim); padding: 0 .25rem .5rem; display: flex; justify-content: space-between;
+}
+.col-count { color: var(--text); }
+.card {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  padding: .55rem .65rem; margin-bottom: .5rem; cursor: pointer; display: block;
+  color: var(--text); text-decoration: none;
+}
+.card:hover { border-color: var(--accent); }
+.card.blocked { border-left: 3px solid var(--blocked); }
+.card-id { font-family: ui-monospace, SF Mono, Consolas, monospace; font-size: .7rem; color: var(--text-dim); }
+.card-title { font-size: .85rem; margin: .15rem 0; line-height: 1.3; }
+.card-meta { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .35rem; }
+.tag {
+  font-family: ui-monospace, SF Mono, Consolas, monospace; font-size: .65rem;
+  background: var(--bg); border: 1px solid var(--border); padding: 1px .35rem; border-radius: 3px;
+  color: var(--text-dim);
+}
+.tag.blocked { color: var(--blocked); border-color: var(--blocked); }
+.tag.claim { color: var(--yellow); }
+.idx li { margin: .3rem 0; }
+.idx a { color: var(--accent); }
+.cardview {
+  max-width: 760px; margin: 0 auto; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 1.25rem 1.5rem;
+}
+.cardview h2 { margin-top: 0; }
+.cardview pre { background: var(--bg); padding: .75rem; border-radius: 4px; overflow-x: auto; }
+.cardview .body { white-space: pre-wrap; font-family: ui-monospace, SF Mono, Consolas, monospace; font-size: .85rem; line-height: 1.5; }
+.empty { color: var(--text-dim); font-size: .8rem; text-align: center; padding: 1rem; }
+"""
+
+
+HTML_HEAD = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<title>{title}</title>
+<link rel="stylesheet" href="/static/style.css"/>
+</head><body>
+"""
+
+
+def render_nav(boards: list[tuple[str, Path]], current: str | None) -> str:
+    parts = [f'<a href="/" class="{"active" if current is None else ""}">all boards</a>']
+    for bid, _ in boards:
+        cls = "active" if bid == current else ""
+        parts.append(f'<a href="/board?id={html.escape(bid)}" class="{cls}">{html.escape(bid)}</a>')
+    return "\n".join(parts)
+
+
+def render_header(boards: list[tuple[str, Path]], current: str | None) -> str:
+    nav = render_nav(boards, current)
+    return (
+        '<header>'
+        '<h1><a href="/">superpowers-kanban</a></h1>'
+        f'<nav>{nav}</nav>'
+        '</header>'
+    )
+
+
+def render_index(boards: list[tuple[str, Path]]) -> str:
+    if not boards:
+        body = '<p class="empty">No boards yet. Run <code>/kanban-init</code> in your project.</p>'
+    else:
+        rows = []
+        for bid, board_dir in boards:
+            tasks = list_tasks(board_dir)
+            done = sum(1 for t in tasks if t.get("status") in ("done", "archived"))
+            total = len(tasks)
+            blocked = sum(1 for t in tasks if t.get("blocked"))
+            rows.append(
+                f'<li><a href="/board?id={html.escape(bid)}">{html.escape(bid)}</a> '
+                f'— {total} cards, {done} done'
+                f'{", " + str(blocked) + " blocked" if blocked else ""}</li>'
+            )
+        body = '<ul class="idx">' + "\n".join(rows) + "</ul>"
+    return (
+        HTML_HEAD.format(title="superpowers-kanban") +
+        render_header(boards, None) +
+        f'<main><h2>Boards</h2>{body}</main>' +
+        '</body></html>'
+    )
+
+
+def render_card_snippet(task: dict, board_id: str) -> str:
+    tid = task.get("id", "?")
+    title = html.escape(str(task.get("title", "(untitled)")))
+    blocked = task.get("blocked", False)
+    classes = "card blocked" if blocked else "card"
+    claim = task.get("claimed_by") or ""
+    tags_html = ""
+    if blocked:
+        tags_html += '<span class="tag blocked">BLOCKED</span>'
+    if claim:
+        tags_html += f'<span class="tag claim">{html.escape(claim)}</span>'
+    for t in (task.get("tags") or []):
+        tags_html += f'<span class="tag">{html.escape(t)}</span>'
+    return (
+        f'<a class="{classes}" href="/card?board={html.escape(board_id)}&amp;task={tid}">'
+        f'<span class="card-id">#{tid}</span>'
+        f'<div class="card-title">{title}</div>'
+        f'<div class="card-meta">{tags_html}</div>'
+        f'</a>'
+    )
+
+
+def render_board(boards: list[tuple[str, Path]], board_id: str, board_dir: Path) -> str:
+    tasks = list_tasks(board_dir)
+    cols: dict[str, list[dict]] = {s: [] for s in STATUS_ORDER}
+    for t in tasks:
+        s = t.get("status", "")
+        if s in cols:
+            cols[s].append(t)
+    cols_html = []
+    for s in STATUS_ORDER:
+        items = cols[s]
+        snippets = "".join(render_card_snippet(t, board_id) for t in items) or '<div class="empty">—</div>'
+        cols_html.append(
+            f'<div class="col">'
+            f'<div class="col-header"><span>{s}</span><span class="col-count">{len(items)}</span></div>'
+            f'{snippets}</div>'
+        )
+    return (
+        HTML_HEAD.format(title=f"{board_id} — superpowers-kanban") +
+        render_header(boards, board_id) +
+        f'<main><div class="board">{"".join(cols_html)}</div></main>' +
+        '</body></html>'
+    )
+
+
+def render_card(boards: list[tuple[str, Path]], board_id: str, board_dir: Path, task_id: int) -> str:
+    task = show_task(board_dir, task_id)
+    if not task:
+        body_html = '<p class="empty">Card not found.</p>'
+    else:
+        title = html.escape(str(task.get("title", "(untitled)")))
+        status = html.escape(str(task.get("status", "")))
+        body = html.escape(str(task.get("body", "")))
+        tags = task.get("tags") or []
+        tags_html = " ".join(f'<span class="tag">{html.escape(t)}</span>' for t in tags)
+        meta_rows = [
+            ("status", status),
+            ("priority", html.escape(str(task.get("priority", "")))),
+            ("blocked", str(bool(task.get("blocked")))),
+            ("claimed_by", html.escape(str(task.get("claimed_by", "") or "-"))),
+            ("created", html.escape(str(task.get("created", "")))),
+            ("updated", html.escape(str(task.get("updated", "")))),
+        ]
+        meta_html = "".join(f'<tr><td>{k}</td><td>{v}</td></tr>' for k, v in meta_rows)
+        body_html = (
+            f'<div class="cardview">'
+            f'<h2>#{task.get("id")} — {title}</h2>'
+            f'<p>{tags_html}</p>'
+            f'<table>{meta_html}</table>'
+            f'<h3>Body</h3>'
+            f'<pre class="body">{body}</pre>'
+            f'</div>'
+        )
+    return (
+        HTML_HEAD.format(title=f"#{task_id} — superpowers-kanban") +
+        render_header(boards, board_id) +
+        f'<main>{body_html}</main>' +
+        '</body></html>'
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "kanban-viewer/0.1"
+
+    # Silence default request logging to keep the orchestrator console clean.
+    def log_message(self, fmt: str, *args) -> None:
+        pass
+
+    def _write(self, code: int, content_type: str, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, body: str, code: int = 200) -> None:
+        self._write(code, "text/html; charset=utf-8", body.encode("utf-8"))
+
+    def _json(self, obj: object, code: int = 200) -> None:
+        self._write(code, "application/json; charset=utf-8", json.dumps(obj, indent=2).encode("utf-8"))
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        sp_dir = self.server.sp_dir  # type: ignore[attr-defined]
+        boards = discover_boards(sp_dir)
+
+        if path == "/":
+            self._html(render_index(boards))
+            return
+        if path == "/static/style.css":
+            self._write(200, "text/css; charset=utf-8", STYLE.encode("utf-8"))
+            return
+        if path == "/board":
+            bid = (qs.get("id") or [""])[0]
+            board_dir = resolve_board(sp_dir, bid)
+            if not board_dir:
+                self._html(HTML_HEAD.format(title="404") + render_header(boards, None) +
+                           f'<main><p class="empty">Board not found: {html.escape(bid)}</p></main></body></html>', code=404)
+                return
+            self._html(render_board(boards, bid, board_dir))
+            return
+        if path == "/card":
+            bid = (qs.get("board") or [""])[0]
+            tid_s = (qs.get("task") or [""])[0]
+            board_dir = resolve_board(sp_dir, bid)
+            if not board_dir or not tid_s.isdigit():
+                self._html(HTML_HEAD.format(title="404") + render_header(boards, None) +
+                           '<main><p class="empty">Card not found.</p></main></body></html>', code=404)
+                return
+            self._html(render_card(boards, bid, board_dir, int(tid_s)))
+            return
+        if path == "/api/boards":
+            self._json([{"id": bid, "dir": str(d.relative_to(sp_dir))} for bid, d in boards])
+            return
+        if path == "/api/board":
+            bid = (qs.get("id") or [""])[0]
+            board_dir = resolve_board(sp_dir, bid)
+            if not board_dir:
+                self._json({"error": "board not found", "id": bid}, code=404)
+                return
+            self._json({"id": bid, "tasks": list_tasks(board_dir)})
+            return
+
+        self._html(HTML_HEAD.format(title="404") + render_header(boards, None) +
+                   '<main><p class="empty">Not found.</p></main></body></html>', code=404)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--project-root", default=".", help="Project root (default: cwd)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--once", action="store_true", help="Render index to stdout and exit (for testing)")
+    args = parser.parse_args()
+
+    if not shutil.which("kanban-md"):
+        die("kanban-md not on PATH. Run /kanban-init first.")
+
+    sp_dir = Path(args.project_root).resolve() / ".superpowers-kanban"
+    if not sp_dir.is_dir():
+        die(f"{sp_dir} not found. Run /kanban-init first.")
+
+    if args.once:
+        print(render_index(discover_boards(sp_dir)))
+        return
+
+    server = HTTPServer((args.host, args.port), Handler)
+    server.sp_dir = sp_dir  # type: ignore[attr-defined]
+    url = f"http://{args.host}:{args.port}/"
+    print(f"[kanban-viewer] Serving {sp_dir} at {url}")
+    print(f"[kanban-viewer] Press Ctrl-C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[kanban-viewer] Stopped.")
+
+
+if __name__ == "__main__":
+    main()
