@@ -4,7 +4,7 @@ A **companion plugin** for [Superpowers](https://github.com/obra/superpowers) th
 
 Plans get broken into bite-sized cards. Agents pick up cards autonomously, execute them via Superpowers' `subagent-driven-development` workflow, and pause whenever they need a human answer. After you answer, work resumes until the board is empty.
 
-> **Status:** alpha — M1 (foundation) only. M2-M6 in progress on branch `claude/superpower-orba-kanban-ALTky`. See [roadmap](#roadmap) below.
+> **Status:** alpha 0.1.0 — all six milestones (M1–M6) shipped on branch `claude/superpower-orba-kanban-ALTky`. Awaiting first real-session validation. See [roadmap](#roadmap) below.
 
 ## What this is and is not
 
@@ -92,7 +92,7 @@ When a subagent needs a human answer:
 - [x] **M3** — `/kanban-auto` + `/kanban-resume` + auto-mode skill + question protocol
 - [x] **M4** — Roadmap aggregation + `/roadmap-status`
 - [x] **M5** — Read-only web viewer + `/kanban-view`
-- [ ] **M6** — Session-start hook, end-to-end tests, polish
+- [x] **M6** — Session-start hook, end-to-end tests, polish
 - [ ] Later — Mirror to Codex / Cursor / Gemini / Copilot harnesses
 
 ## License
